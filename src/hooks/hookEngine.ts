@@ -29,6 +29,49 @@ export class HookEngine {
 		return { result: null, modifiedPayload: payload }
 	}
 
+	private commandType(toolName: string): "safe" | "destructive" {
+		const destructive = ["write_to_file", "delete_file", "execute_command"] // Expand as needed
+		return destructive.includes(toolName) ? "destructive" : "safe"
+	}
+
+	preHook(toolName: string, args: any, payload: any) {
+		// Existing code...
+		if (this.commandType(toolName) === "destructive") {
+			// Scope enforcement
+			const intentsPath = path.join(process.cwd(), ".orchestration", "active_intents.yaml")
+			const intents = yaml.load(fs.readFileSync(intentsPath, "utf8")) as { active_intents: any[] }
+			const intent = intents.active_intents.find((i) => i.id === this.activeIntentId)
+			if (
+				!intent ||
+				!intent.owned_scope.some((scope) => args.path?.match(new RegExp(scope.replace(/\*\*/g, ".*"))))
+			) {
+				throw new Error(`Scope Violation: ${this.activeIntentId} not authorized for ${args.path}`)
+			}
+			// HITL authorization (use VS Code API)
+			const vscode = require("vscode") // Assume imported
+			const choice = await vscode.window.showWarningMessage(
+				`Approve ${toolName} on ${args.path}?`,
+				"Approve",
+				"Reject",
+			)
+			if (choice !== "Approve") {
+				return { error: { type: "tool-error", message: "User rejected" } } // For autonomous recovery
+			}
+		}
+		// .intentignore check (simple impl)
+		const ignorePath = path.join(process.cwd(), ".intentignore")
+		if (
+			fs.existsSync(ignorePath) &&
+			fs
+				.readFileSync(ignorePath, "utf8")
+				.split("\n")
+				.some((line) => args.path?.includes(line.trim()))
+		) {
+			throw new Error(`Ignored by .intentignore: ${args.path}`)
+		}
+		return { result: null, modifiedPayload: payload }
+	}
+
 	// Placeholder for postHook (expand in Phase 3)
 	postHook(toolName: string, args: any, result: any) {}
 }
