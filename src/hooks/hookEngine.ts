@@ -64,8 +64,27 @@ export class HookEngine {
 		return ["write_file", "execute_command"].includes(toolName) ? "destructive" : "safe"
 	}
 
-	// Post-hook placeholder for Phase 3
-	postHook() {}
+	// Add to HookEngine class
+	postHook(toolName: string, args: any, result: any) {
+		if (toolName === "write_file") {
+			const oldContent = fs.readFileSync(args.path, "utf8") // Before write (assume called post but use args.initial_hash for old)
+			const newContent = args.content
+			const hash = crypto.createHash("sha256").update(newContent).digest("hex")
+			const mutation = newContent.length - oldContent.length > 50 ? "INTENT_EVOLUTION" : "AST_REFACTOR" // Heuristic
+			const trace = {
+				id: uuidv4(),
+				timestamp: new Date().toISOString(),
+				vcs: { revision_id: "git_sha" },
+				files: [
+					{
+						relative_path: args.path,
+						conversations: [{ ranges: [{ content_hash: hash }], related: [{ value: args.intent_id }] }],
+					},
+				],
+			}
+			fs.appendFileSync(".orchestration/agent_trace.jsonl", JSON.stringify(trace) + "\n")
+		}
+	}
 }
 
 // Usage in agent loop: hook.preHook(toolName, args, payload)
