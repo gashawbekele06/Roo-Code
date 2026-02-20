@@ -4,10 +4,16 @@ active_intents:
     status: "IN_PROGRESS"
     owned_scope:
       - "src/api/weather/**"
-      - "src/middleware/weather.ts"
     constraints:
-      - "Use only open APIs, no paid services"
-      - "Maintain RESTful structure"
+      - "Use open APIs only"
     acceptance_criteria:
-      - "Unit tests in tests/api/weather/ pass"
-      - "Endpoint responds in < 500ms"
+      - "Tests pass"
+  - id: "INT-002"
+    name: "Refactor Auth"
+    status: "PENDING"
+    owned_scope:
+      - "src/auth/**"
+    constraints:
+      - "Backward compatible"
+    acceptance_criteria:
+      - "No breaking changes"
