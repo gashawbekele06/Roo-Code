@@ -8,6 +8,9 @@ active_intents:
       - "Use open APIs only"
     acceptance_criteria:
       - "Tests pass"
+    intent_language: "AISpec v1"  # Reference
+    formal_definition: "Mathematical intent: f(x) = weather_api(x) where x in owned_scope"
+
   - id: "INT-002"
     name: "Refactor Auth"
     status: "PENDING"
@@ -17,3 +20,5 @@ active_intents:
       - "Backward compatible"
     acceptance_criteria:
       - "No breaking changes"
+    intent_language: "AISpec v1"  # Reference
+    formal_definition: "Mathematical intent: f(x) = refactor(auth) where x in scope"
