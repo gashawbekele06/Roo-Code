@@ -73,5 +73,36 @@ export class HookEngine {
 	}
 
 	// Placeholder for postHook (expand in Phase 3)
-	postHook(toolName: string, args: any, result: any) {}
+	postHook(toolName: string, args: any, result: any) {
+		if (toolName === "write_to_file") {
+			const contentHash = computeContentHash(args.content)
+			const mutationClass = classifyMutation(args.diff || args.content) // Assume diff provided
+			const trace = {
+				id: uuidv4(),
+				timestamp: new Date().toISOString(),
+				vcs: { revision_id: "git_sha_placeholder" }, // Use child_process to get git rev-parse HEAD
+				files: [
+					{
+						relative_path: args.path,
+						conversations: [
+							{
+								url: "session_placeholder",
+								contributor: { entity_type: "AI", model_identifier: "claude-3-5-sonnet" },
+								ranges: [
+									{
+										start_line: args.start || 1,
+										end_line: args.end || 10,
+										content_hash: contentHash,
+									},
+								],
+								related: [{ type: "specification", value: args.intent_id }],
+							},
+						],
+					},
+				],
+			}
+			const tracePath = path.join(process.cwd(), ".orchestration", "agent_trace.jsonl")
+			fs.appendFileSync(tracePath, JSON.stringify(trace) + "\n")
+		}
+	}
 }
