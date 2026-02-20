@@ -1,50 +1,34 @@
 // src/hooks/hookEngine.ts
-import * as fs from 'fs';
-import * as crypto from 'crypto';
-import * as path from 'path';
-import * as yaml from 'js-yaml'; // Assume installed or add dependency
+import * as fs from "fs"
+import * as path from "path"
+import * as yaml from "js-yaml"
+import { v4 as uuidv4 } from "uuid" // For future use
 
 export class HookEngine {
-  private activeIntent: any = null;
+	private activeIntentId: string | null = null
 
-  preHook(toolName: string, args: any) {
-    if (toolName === 'select_active_intent') {
-      // Load context from active_intents.yaml
-      const intents = yaml.load(fs.readFileSync(path.join('.orchestration', 'active_intents.yaml'), 'utf8'));
-      this.activeIntent = intents.active_intents.find((i: any) => i.id === args.intent_id);
-      if (!this.activeIntent) throw new Error('Invalid Intent ID');
-      // Inject context (return XML block)
-      return `<intent_context>${JSON.stringify(this.activeIntent)}</intent_context>`;
-    }
-    if (toolName === 'write_to_file' && !this.activeIntent) {
-      throw new Error('Must select intent first');
-    }
-    // Scope check
-    if (toolName === 'write_to_file' && !this.activeIntent.owned_scope.some((scope: string) => args.relative_path.startsWith(scope))) {
-      throw new Error('Scope Violation');
-    }
-  }
+	preHook(toolName: string, args: any, payload: any) {
+		if (toolName === "select_active_intent") {
+			const intentsPath = path.join(process.cwd(), ".orchestration", "active_intents.yaml")
+			if (!fs.existsSync(intentsPath)) throw new Error("active_intents.yaml not found")
+			const intents = yaml.load(fs.readFileSync(intentsPath, "utf8")) as { active_intents: any[] }
+			const selected = intents.active_intents.find((i) => i.id === args.intent_id)
+			if (!selected) throw new Error(`Invalid Intent ID: ${args.intent_id}`)
+			this.activeIntentId = args.intent_id
+			const context = {
+				constraints: selected.constraints,
+				scope: selected.owned_scope,
+			}
+			const xmlBlock = `<intent_context>${JSON.stringify(context)}</intent_context>`
+			// Inject into prompt payload (assume payload has 'prompt' field)
+			if (payload && payload.prompt) payload.prompt += `\n${xmlBlock}`
+			return { result: xmlBlock, modifiedPayload: payload }
+		}
+		// Gatekeeper for other tools
+		if (!this.activeIntentId) throw new Error("You must cite a valid active Intent ID.")
+		return { result: null, modifiedPayload: payload }
+	}
 
-  postHook(toolName: string, args: any, result: any) {
-    if (toolName === 'write_to_file') {
-      // Compute hash
-      const contentHash = crypto.createHash('sha256').update(args.content).digest('hex');
-      // Append to agent_trace.jsonl
-      const traceEntry = {
-        id: crypto.randomUUID(),
-        timestamp: new Date().toISOString(),
-        vcs: { revision_id: 'git_sha_placeholder' }, // Integrate git rev-parse HEAD
-        files: [{
-          relative_path: args.relative_path,
-          conversations: [{
-            url: 'session_placeholder',
-            contributor: { entity_type: 'AI', model_identifier: 'claude-3-5-sonnet' },
-            ranges: [{ start_line: 1, end_line: 10, content_hash: contentHash }], // Adjust lines
-            related: [{ type: 'specification', value: this.activeIntent.id }]
-          }]
-        }]
-      };
-      fs.appendFileSync(path.join('.orchestration', 'agent_trace.jsonl'), JSON.stringify(traceEntry) + '\n');
-    }
-  }
+	// Placeholder for postHook (expand in Phase 3)
+	postHook(toolName: string, args: any, result: any) {}
 }
