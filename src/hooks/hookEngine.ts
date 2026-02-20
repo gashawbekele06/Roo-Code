@@ -1,5 +1,4 @@
 // src/hooks/hookEngine.ts
-
 import * as fs from "fs"
 import * as path from "path"
 import * as yaml from "js-yaml"
@@ -7,246 +6,204 @@ import * as crypto from "crypto"
 import * as vscode from "vscode"
 import { v4 as uuidv4 } from "uuid"
 
-// ──────────────────────────────────────────────────────────────
-// Utility functions (you can also move them to hooks/utils.ts)
+type PreHookFunction = (toolName: string, args: any, payload: any) => void
 
 function computeContentHash(content: string): string {
 	return crypto.createHash("sha256").update(content).digest("hex")
 }
 
-// Very simple heuristic classification (can be improved with real diff/AST later)
-function classifyMutation(before: string, after: string): "AST_REFACTOR" | "INTENT_EVOLUTION" {
-	const diffLength = Math.abs(before.length - after.length)
-	const lineCountChange = before.split("\n").length - after.split("\n").length
-	if (diffLength < 300 && Math.abs(lineCountChange) < 10) {
+function simpleMutationClass(before: string, after: string): "AST_REFACTOR" | "INTENT_EVOLUTION" {
+	const diffSize = Math.abs(before.length - after.length)
+	const linesBefore = before.split("\n").length
+	const linesAfter = after.split("\n").length
+	const lineDiff = Math.abs(linesBefore - linesAfter)
+
+	if (diffSize < 400 && lineDiff < 15) {
 		return "AST_REFACTOR"
 	}
 	return "INTENT_EVOLUTION"
 }
 
-// ──────────────────────────────────────────────────────────────
-
 export class HookEngine {
 	private activeIntentId: string | null = null
-	private activeIntent: any = null // cached selected intent object
+	private activeIntent: any = null
 
-	/**
-	 * Called before a tool is executed.
-	 * Main responsibilities:
-	 * - Enforce intent selection (gatekeeper)
-	 * - Load & inject context when select_active_intent is called
-	 * - Scope validation
-	 * - HITL approval for destructive actions
-	 * - Concurrency / stale file check
-	 */
-	preHook(toolName: string, args: any, payload: any = {}): { modifiedPayload?: any; error?: any } {
-		// ─── Gatekeeper: most tools require an active intent ───────────────────────
-		if (toolName !== "select_active_intent" && !this.activeIntentId) {
-			throw new Error("You must call select_active_intent with a valid Intent ID first.")
-		}
+	private preHooks: PreHookFunction[] = [
+		this.gatekeeper.bind(this),
+		this.scopeEnforcer.bind(this),
+		this.intentIgnoreChecker.bind(this),
+		this.hitlApprover.bind(this),
+		this.staleFileChecker.bind(this),
+	]
 
-		// ─── Handle intent selection ──────────────────────────────────────────────
-		if (toolName === "select_active_intent") {
-			if (!args.intent_id) {
-				throw new Error("intent_id is required")
+	preHook(toolName: string, args: any, payload: any = {}) {
+		try {
+			// Run composable pre-hooks
+			for (const hookFn of this.preHooks) {
+				hookFn(toolName, args, payload)
 			}
 
-			const intentsPath = path.join(process.cwd(), ".orchestration", "active_intents.yaml")
-			if (!fs.existsSync(intentsPath)) {
-				throw new Error("active_intents.yaml not found in .orchestration/")
-			}
+			// Special handling: intent selection + curated context injection
+			if (toolName === "select_active_intent") {
+				if (!args.intent_id) throw new Error("intent_id is required")
 
-			const data = yaml.load(fs.readFileSync(intentsPath, "utf8")) as { active_intents: any[] }
-			const selected = data.active_intents.find((i) => i.id === args.intent_id)
+				const intentsPath = path.join(process.cwd(), ".orchestration", "active_intents.yaml")
+				if (!fs.existsSync(intentsPath)) throw new Error("active_intents.yaml not found")
 
-			if (!selected) {
-				throw new Error(`Intent not found: ${args.intent_id}`)
-			}
+				const data = yaml.load(fs.readFileSync(intentsPath, "utf8")) as { active_intents: any[] }
+				const selected = data.active_intents.find((i) => i.id === args.intent_id)
 
-			this.activeIntentId = args.intent_id
-			this.activeIntent = selected
+				if (!selected) throw new Error(`Intent not found: ${args.intent_id}`)
 
-			// Build context block to inject into prompt
-			const context = {
-				intent_id: selected.id,
-				name: selected.name,
-				constraints: selected.constraints || [],
-				owned_scope: selected.owned_scope || [],
-				acceptance_criteria: selected.acceptance_criteria || [],
-			}
+				this.activeIntentId = args.intent_id
+				this.activeIntent = selected
 
-			const xmlBlock = `<intent_context>${JSON.stringify(context, null, 2)}</intent_context>`
+				const curatedContext = {
+					intent_id: selected.id,
+					name: selected.name,
+					constraints: selected.constraints || [],
+					owned_scope: selected.owned_scope || [],
+				}
 
-			// Inject into the prompt payload (assumes payload has .prompt or .messages)
-			if (payload && typeof payload === "object") {
+				const xmlBlock = `<intent_context>${JSON.stringify(curatedContext, null, 2)}</intent_context>`
+
+				// Inject into prompt (supports both flat prompt and messages array)
 				if (payload.prompt) {
 					payload.prompt += `\n\n${xmlBlock}`
 				} else if (Array.isArray(payload.messages)) {
-					// Anthropic / OpenAI style messages
-					payload.messages.push({
-						role: "system",
-						content: xmlBlock,
-					})
+					payload.messages.push({ role: "system", content: xmlBlock })
 				}
+
+				return { modifiedPayload: payload }
 			}
 
 			return { modifiedPayload: payload }
-		}
-
-		// ─── Scope enforcement (Phase 2) ──────────────────────────────────────────
-		if (this.activeIntent && ["write_to_file", "delete_file", "execute_command"].includes(toolName)) {
-			const targetPath = args.path || args.file || args.filename
-			if (targetPath) {
-				const allowed = this.activeIntent.owned_scope?.some((pattern: string) => {
-					const regex = new RegExp(
-						pattern.replace(/\./g, "\\.").replace(/\*\*/g, ".*").replace(/\*/g, "[^/]*"),
-					)
-					return regex.test(targetPath)
-				})
-
-				if (!allowed) {
-					throw new Error(
-						`Scope Violation: Intent ${this.activeIntentId} is not allowed to modify ${targetPath}`,
-					)
-				}
-			}
-		}
-
-		// ─── Human-in-the-loop approval for destructive actions (Phase 2) ─────────
-		if (["write_to_file", "delete_file"].includes(toolName)) {
-			const choice = vscode.window.showWarningMessage(
-				`Allow AI to ${toolName.replace("_", " ")} ${args.path || "(unknown file)"}?`,
-				"Approve",
-				"Reject",
-			)
-
-			if (choice.then) {
-				// It's a Thenable — wait for user
-				return choice.then((selected) => {
-					if (selected !== "Approve") {
-						return { error: { type: "tool-error", message: "User rejected change" } }
-					}
-					return {}
-				}) as any
-			}
-		}
-
-		// ─── Concurrency control / stale file check (Phase 4) ─────────────────────
-		if (toolName === "write_to_file") {
-			const targetPath = args.path
-			if (!targetPath) {
-				throw new Error("path is required for write_to_file")
-			}
-
-			const fullPath = path.resolve(process.cwd(), targetPath)
-
-			if (!args.initial_hash) {
-				// We can make it optional or required depending on strictness
-				console.warn("[HookEngine] No initial_hash provided → skipping stale check")
-			} else {
-				let currentContent = ""
-				try {
-					currentContent = fs.readFileSync(fullPath, "utf8")
-				} catch (err: any) {
-					if (err.code === "ENOENT") {
-						// New file — only allow if initial_hash signals new file
-						if (args.initial_hash !== "new-file") {
-							throw new Error("File does not exist, but initial_hash was provided")
-						}
-					} else {
-						throw err
-					}
-				}
-
-				const currentHash = computeContentHash(currentContent)
-
-				if (currentHash !== args.initial_hash && args.initial_hash !== "new-file") {
-					throw new Error("Stale File: Conflict detected. File content has changed since you last read it.")
-				}
-			}
-		}
-
-		return {}
-	}
-
-	/**
-	 * Called after a tool has been successfully executed
-	 * Main responsibility: record traceability (agent_trace.jsonl)
-	 */
-	postHook(toolName: string, args: any, result: any): void {
-		if (toolName !== "write_to_file" || !this.activeIntentId) {
-			return
-		}
-
-		const targetPath = args.path
-		const fullPath = path.resolve(process.cwd(), targetPath)
-
-		let newContent = args.content
-		if (!newContent && fs.existsSync(fullPath)) {
-			newContent = fs.readFileSync(fullPath, "utf8")
-		}
-
-		if (!newContent) {
-			console.warn("[HookEngine] Could not determine new content for tracing")
-			return
-		}
-
-		const contentHash = computeContentHash(newContent)
-
-		// Try to get old content for classification (best effort)
-		let oldContent = ""
-		try {
-			oldContent = fs.readFileSync(fullPath, "utf8") // note: this is after write
-		} catch {}
-
-		const mutation_class = classifyMutation(oldContent, newContent)
-
-		const traceEntry = {
-			id: uuidv4(),
-			timestamp: new Date().toISOString(),
-			vcs: {
-				revision_id: "HEAD", // ← improve: use git rev-parse HEAD via child_process
-			},
-			files: [
-				{
-					relative_path: targetPath,
-					conversations: [
-						{
-							url: "session-placeholder", // ← improve with real session id
-							contributor: {
-								entity_type: "AI",
-								model_identifier: "claude-3-5-sonnet", // ← make dynamic if possible
-							},
-							ranges: [
-								{
-									start_line: args.start_line || 1,
-									end_line: args.end_line || newContent.split("\n").length,
-									content_hash: contentHash,
-								},
-							],
-							related: [
-								{
-									type: "specification",
-									value: this.activeIntentId,
-								},
-							],
-						},
-					],
+		} catch (err: any) {
+			console.error("[HookEngine] Pre-hook error:", err)
+			return {
+				error: {
+					type: "hook-error",
+					message: err.message,
+					code: "PRE_HOOK_FAILED",
 				},
-			],
+			}
 		}
-
-		const tracePath = path.join(process.cwd(), ".orchestration", "agent_trace.jsonl")
-		const dir = path.dirname(tracePath)
-
-		if (!fs.existsSync(dir)) {
-			fs.mkdirSync(dir, { recursive: true })
-		}
-
-		fs.appendFileSync(tracePath, JSON.stringify(traceEntry) + "\n")
 	}
 
-	// Helper: reset state (useful for new sessions)
+	postHook(toolName: string, args: any, result: any) {
+		if (toolName !== "write_file" || !this.activeIntentId || !result?.success) return
+
+		try {
+			const filePath = path.resolve(process.cwd(), args.path)
+			const newContent = args.content || fs.readFileSync(filePath, "utf8")
+
+			const contentHash = computeContentHash(newContent)
+
+			// Attempt to get old content (best effort - assumes initial_hash was provided)
+			let oldContent = ""
+			if (args.initial_hash && fs.existsSync(filePath)) {
+				oldContent = fs.readFileSync(filePath, "utf8") // note: this is after write
+			}
+
+			const mutation_class = simpleMutationClass(oldContent, newContent)
+
+			const traceEntry = {
+				id: uuidv4(),
+				timestamp: new Date().toISOString(),
+				vcs: { revision_id: "HEAD" }, // improve later with git command
+				files: [
+					{
+						relative_path: args.path,
+						conversations: [
+							{
+								url: "session-placeholder",
+								contributor: { entity_type: "AI", model_identifier: "claude-3-5-sonnet" },
+								ranges: [
+									{
+										start_line: 1,
+										end_line: newContent.split("\n").length,
+										content_hash: contentHash,
+									},
+								],
+								related: [{ type: "specification", value: this.activeIntentId }],
+							},
+						],
+					},
+				],
+				mutation_class,
+			}
+
+			const tracePath = path.join(process.cwd(), ".orchestration", "agent_trace.jsonl")
+			fs.mkdirSync(path.dirname(tracePath), { recursive: true })
+			fs.appendFileSync(tracePath, JSON.stringify(traceEntry) + "\n")
+		} catch (err) {
+			console.error("[HookEngine] Post-hook trace failed:", err)
+		}
+	}
+
+	// ─── Composable pre-hook functions ────────────────────────────────────────
+
+	private gatekeeper(toolName: string) {
+		if (this.classify(toolName) === "destructive" && !this.activeIntentId) {
+			throw new Error("Intent required before destructive action")
+		}
+	}
+
+	private scopeEnforcer(toolName: string, args: any) {
+		if (this.classify(toolName) !== "destructive" || !args.path) return
+		const allowed = this.activeIntent?.owned_scope?.some(
+			(p: string) =>
+				args.path.startsWith(p.replace("/**", "")) || new RegExp(p.replace(/\*\*/g, ".*")).test(args.path),
+		)
+		if (!allowed) throw new Error(`Scope violation: ${args.path} not in ${this.activeIntentId} scope`)
+	}
+
+	private intentIgnoreChecker(toolName: string, args: any) {
+		if (!args.path) return
+		const ignorePath = path.join(process.cwd(), ".intentignore")
+		if (!fs.existsSync(ignorePath)) return
+		const patterns = fs
+			.readFileSync(ignorePath, "utf8")
+			.split("\n")
+			.map((l) => l.trim())
+			.filter(Boolean)
+		if (patterns.some((p) => args.path.includes(p))) {
+			throw new Error(`File ignored by .intentignore: ${args.path}`)
+		}
+	}
+
+	private async hitlApprover(toolName: string, args: any) {
+		if (this.classify(toolName) !== "destructive") return
+		const choice = await vscode.window.showWarningMessage(
+			`Allow AI to ${toolName.replace(/_/g, " ")} ${args.path || "(unknown)"}?`,
+			"Approve",
+			"Reject",
+		)
+		if (choice !== "Approve") throw new Error("Change rejected by user")
+	}
+
+	private staleFileChecker(toolName: string, args: any) {
+		if (toolName !== "write_file" || !args.initial_hash || !args.path) return
+
+		const fullPath = path.resolve(process.cwd(), args.path)
+		let currentContent = ""
+		try {
+			currentContent = fs.readFileSync(fullPath, "utf8")
+		} catch (err: any) {
+			if (err.code === "ENOENT" && args.initial_hash === "new-file") return
+			throw err
+		}
+
+		const currentHash = computeContentHash(currentContent)
+		if (currentHash !== args.initial_hash) {
+			throw new Error("Stale File: Content changed since read. Re-read and retry.")
+		}
+	}
+
+	private classify(toolName: string): "safe" | "destructive" {
+		return ["write_file", "delete_file", "execute_command"].includes(toolName) ? "destructive" : "safe"
+	}
+
 	reset() {
 		this.activeIntentId = null
 		this.activeIntent = null
